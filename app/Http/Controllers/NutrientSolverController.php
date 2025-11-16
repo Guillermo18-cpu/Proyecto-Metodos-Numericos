@@ -8,12 +8,13 @@ class NutrientSolverController extends Controller
 {
     public function index()
     {
-        return view('mix.simple'); // ver archivo blade más abajo
+        // Se usará el mix.simple.blade.php modificado en el siguiente paso
+        return view('mix.simple'); 
     }
 
     public function solve(Request $request)
     {
-        // Validación mínima (los campos vienen del formulario)
+        // Validación mínima
         $request->validate([
             'a11'=>'required','a12'=>'required','a13'=>'required',
             'a21'=>'required','a22'=>'required','a23'=>'required',
@@ -38,68 +39,42 @@ class NutrientSolverController extends Controller
         $tol = $request->input('tolerance', 0.001);
         $maxIter = $request->input('maxIter', 200);
 
-        // Check square and sizes
-        if (count($A) !== 3 || count($A[0]) !== 3) {
-            return $this->jsonError('La matriz A debe ser 3x3.');
-        }
-        if (count($b) !== 3) {
-            return $this->jsonError('El vector objetivo debe tener 3 valores.');
+        if (count($A) !== 3 || count($A[0]) !== 3 || count($b) !== 3) {
+            return $this->jsonError('La matriz debe ser 3x3 y el vector 3x1.');
         }
 
-        // Diagonal dominance check (informativo)
+        // --- MÉTODO ÚNICO: GAUSS-SEIDEL ---
         $isDiag = $this->isDiagonallyDominant($A);
+        $result = $this->gaussSeidel($A, $b, $tol, $maxIter);
 
-        // Ejecutar Gauss-Seidel
-        $gs = $this->gaussSeidel($A, $b, $tol, $maxIter);
+        $methodUsed = 'Gauss-Seidel (Método Iterativo)';
+        $converged = $result['status'] === 'ok';
+        $solution = $converged ? $result['solution'] : array_fill(0, 3, 0.0); // Retorna ceros si no converge
+        $iterations = $result['iterations'] ?? $maxIter;
+        $residual = $converged ? $result['residual'] : $this->residualInf($A, $solution, $b); // Calcula residual si convergió
+        // ----------------------------------
 
-        // Ejecutar Jacobi también (informativo)
-        $jac = $this->jacobi($A, $b, $tol, $maxIter);
-
-        // Si ninguno converge usar fallback directo
-        if (($gs['status'] ?? '') !== 'ok' && ($jac['status'] ?? '') !== 'ok') {
-            $fallbackSolution = $this->gaussianElimination($A, $b);
-            $methodUsed = 'Gaussian elimination (fallback)';
-            $solution = $fallbackSolution;
-            $converged = true;
-            $iterations = null;
-            $residual = $this->residualInf($A, $solution, $b);
-        } else {
-            // Preferir Gauss-Seidel si convergió
-            if (($gs['status'] ?? '') === 'ok') {
-                $methodUsed = 'Gauss-Seidel';
-                $solution = $gs['solution'];
-                $converged = true;
-                $iterations = $gs['iterations'];
-                $residual = $gs['residual'];
-            } else {
-                $methodUsed = 'Jacobi';
-                $solution = $jac['solution'];
-                $converged = true;
-                $iterations = $jac['iterations'];
-                $residual = $jac['residual'];
-            }
+        // Si no converge, lanzamos un error que el frontend pueda manejar
+        if (!$converged) {
+             return $this->jsonError('El método Gauss-Seidel no convergió después de ' . $maxIter . ' iteraciones. Intenta cambiar la tolerancia o los ingredientes.', 400);
         }
 
-        // Interpretación y validaciones finales
-        // Si solución contiene negativos -> advertencia (puede ser físicamente inviable)
+        // Interpretación y validaciones finales (como antes)
         $hasNegative = false;
         foreach ($solution as $v) if ($v < -1e-12) { $hasNegative = true; break; }
 
-        // Normalizar solución a porcentajes (si la suma es cero o negativa, no normalizar)
         $sum = array_sum($solution);
         $normalizedPerc = null;
         if ($sum > 1e-12) {
             $normalizedPerc = array_map(function($v) use ($sum){
-                return ($v / $sum) * 100.0; // en %
+                return ($v / $sum) * 100.0;
             }, $solution);
         }
 
-        // Composición lograda: A * solution
-        $achieved = $this->matVecMul($A, $solution); // en decimales (0..1)
-        // Convertir a % para mostrar
+        $achieved = $this->matVecMul($A, $solution);
         $achievedPerc = array_map(function($v){ return $v * 100.0; }, $achieved);
 
-        // Responder JSON (la vista usa fetch/ajax)
+        // Respuesta JSON
         return response()->json([
             'status' => 'ok',
             'methodUsed' => $methodUsed,
@@ -108,15 +83,13 @@ class NutrientSolverController extends Controller
             'iterations' => $iterations,
             'residual' => $residual,
             'rawSolution' => $solution,
-            'normalizedPercent' => $normalizedPerc, // puede ser null si suma ~ 0
+            'normalizedPercent' => $normalizedPerc,
             'hasNegative' => $hasNegative,
             'achievedPerc' => $achievedPerc,
-            'A' => $A,
-            'b' => $b
         ]);
     }
 
-    /* ---------- helpers numeric ---------- */
+    /* ---------- helpers numeric (Se mantienen) ---------- */
 
     // Si el usuario pone 20 -> 0.20; 0.2 -> 0.2
     private function toFraction($v)
@@ -135,7 +108,8 @@ class NutrientSolverController extends Controller
             $diag = abs($A[$i][$i]);
             $sum = 0.0;
             for ($j = 0; $j < $n; $j++) if ($j !== $i) $sum += abs($A[$i][$j]);
-            if ($diag < $sum) return false;
+            // Estricta dominancia diagonal (condición suficiente, no necesaria)
+            if ($diag <= $sum) return false;
         }
         return true;
     }
@@ -153,80 +127,33 @@ class NutrientSolverController extends Controller
         return $max;
     }
 
-    private function jacobi($A, $b, $tol, $maxIter)
-    {
-        $n = count($A);
-        $x = array_fill(0, $n, 0.0);
-        $xNew = $x;
-        for ($k = 1; $k <= $maxIter; $k++) {
-            for ($i = 0; $i < $n; $i++) {
-                $sum = 0.0;
-                for ($j = 0; $j < $n; $j++) {
-                    if ($j !== $i) $sum += $A[$i][$j] * $x[$j];
-                }
-                $xNew[$i] = ($b[$i] - $sum) / $A[$i][$i];
-            }
-            $err = $this->residualInf($A, $xNew, $b);
-            $x = $xNew;
-            if ($err <= $tol) {
-                return ['status'=>'ok','solution'=>$x,'iterations'=>$k,'residual'=>$err];
-            }
-        }
-        return ['status'=>'no_converge','iterations'=>$maxIter];
-    }
-
     private function gaussSeidel($A, $b, $tol, $maxIter)
     {
         $n = count($A);
         $x = array_fill(0, $n, 0.0);
         for ($k = 1; $k <= $maxIter; $k++) {
+            $xOld = $x; // Guardar la solución de la iteración anterior para calcular el error
             for ($i = 0; $i < $n; $i++) {
                 $sum = 0.0;
                 for ($j = 0; $j < $n; $j++) if ($j !== $i) $sum += $A[$i][$j] * $x[$j];
                 $x[$i] = ($b[$i] - $sum) / $A[$i][$i];
             }
-            $err = $this->residualInf($A, $x, $b);
+            
+            // Error de convergencia: se calcula como la norma-infinito de la diferencia entre xNew y xOld
+            $err = 0.0;
+            for ($i = 0; $i < $n; $i++) {
+                $diff = abs($x[$i] - $xOld[$i]);
+                if ($diff > $err) $err = $diff;
+            }
+
             if ($err <= $tol) {
-                return ['status'=>'ok','solution'=>$x,'iterations'=>$k,'residual'=>$err];
+                // Aquí calculamos el residuo final para ser más precisos con Ax-b
+                $residual = $this->residualInf($A, $x, $b); 
+                return ['status'=>'ok','solution'=>$x,'iterations'=>$k,'residual'=>$residual];
             }
         }
+        // No convergió
         return ['status'=>'no_converge','iterations'=>$maxIter];
-    }
-
-    private function gaussianElimination($A, $b)
-    {
-        $n = count($A);
-        $M = [];
-        for ($i = 0; $i < $n; $i++) {
-            $M[$i] = $A[$i];
-            $M[$i][] = $b[$i];
-        }
-
-        for ($k = 0; $k < $n; $k++) {
-            // pivot
-            $maxRow = $k;
-            $maxVal = abs($M[$k][$k]);
-            for ($r = $k+1; $r < $n; $r++) {
-                if (abs($M[$r][$k]) > $maxVal) { $maxVal = abs($M[$r][$k]); $maxRow = $r; }
-            }
-            if ($maxRow !== $k) {
-                $tmp = $M[$k]; $M[$k] = $M[$maxRow]; $M[$maxRow] = $tmp;
-            }
-            // eliminate
-            for ($i = $k+1; $i < $n; $i++) {
-                if ($M[$k][$k] == 0) continue;
-                $f = $M[$i][$k] / $M[$k][$k];
-                for ($j = $k; $j <= $n; $j++) $M[$i][$j] -= $f * $M[$k][$j];
-            }
-        }
-
-        $x = array_fill(0, $n, 0.0);
-        for ($i = $n-1; $i >= 0; $i--) {
-            $s = $M[$i][$n];
-            for ($j = $i+1; $j < $n; $j++) $s -= $M[$i][$j] * $x[$j];
-            $x[$i] = $s / $M[$i][$i];
-        }
-        return $x;
     }
 
     private function matVecMul($A, $x)
