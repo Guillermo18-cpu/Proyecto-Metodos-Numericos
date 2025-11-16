@@ -3,143 +3,129 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Validator;
 
 class NutrientSolverController extends Controller
 {
     public function index()
     {
-        return view('nutrient_solver');
+        return view('mix.simple'); // ver archivo blade más abajo
     }
 
     public function solve(Request $request)
     {
-        // Validación básica de formato de texto (será parseado a JSON luego)
-        $validator = Validator::make($request->all(), [
-            'matrixA' => 'required|string',
-            'vectorB' => 'required|string',
-            'method' => 'required|string',
-            'tolerance' => 'required|numeric',
-            'maxIter' => 'required|integer|min:1|max:10000'
+        // Validación mínima (los campos vienen del formulario)
+        $request->validate([
+            'a11'=>'required','a12'=>'required','a13'=>'required',
+            'a21'=>'required','a22'=>'required','a23'=>'required',
+            'a31'=>'required','a32'=>'required','a33'=>'required',
+            'b1'=>'required','b2'=>'required','b3'=>'required',
+            'tolerance'=>'nullable|numeric',
+            'maxIter'=>'nullable|integer'
         ]);
 
-        if ($validator->fails()) {
-            $errors = $validator->errors()->all();
-            return $this->respond($request, ['error' => 'Validation error', 'messages' => $errors], 422);
+        // Leer y convertir valores (si el usuario escribe 20 se interpreta como 20% -> 0.20)
+        $A = [
+            [$this->toFraction($request->a11), $this->toFraction($request->a12), $this->toFraction($request->a13)],
+            [$this->toFraction($request->a21), $this->toFraction($request->a22), $this->toFraction($request->a23)],
+            [$this->toFraction($request->a31), $this->toFraction($request->a32), $this->toFraction($request->a33)],
+        ];
+        $b = [
+            $this->toFraction($request->b1),
+            $this->toFraction($request->b2),
+            $this->toFraction($request->b3),
+        ];
+
+        $tol = $request->input('tolerance', 0.001);
+        $maxIter = $request->input('maxIter', 200);
+
+        // Check square and sizes
+        if (count($A) !== 3 || count($A[0]) !== 3) {
+            return $this->jsonError('La matriz A debe ser 3x3.');
+        }
+        if (count($b) !== 3) {
+            return $this->jsonError('El vector objetivo debe tener 3 valores.');
         }
 
-        // Parseo JSON (esperamos un array de arrays y un array)
-        $A = json_decode($request->input('matrixA'), true);
-        $b = json_decode($request->input('vectorB'), true);
-
-        if (!is_array($A) || !is_array($b)) {
-            return $this->respond($request, ['error' => 'Formato JSON inválido. A debe ser [[...],[...]] y b debe ser [...]'], 400);
-        }
-
-        // Normalizar tipos (float)
-        try {
-            $A = $this->arrayToFloatMatrix($A);
-            $b = $this->arrayToFloatVector($b);
-        } catch (\Exception $e) {
-            return $this->respond($request, ['error' => 'La matriz o el vector contienen valores no numéricos.'], 400);
-        }
-
-        // Tamaños
-        $n = count($A);
-        if ($n === 0 || count($b) !== $n) {
-            return $this->respond($request, ['error' => 'La dimensión de A y b no coincide o está vacía.'], 400);
-        }
-
-        $method = $request->input('method');
-        $tol = floatval($request->input('tolerance'));
-        $maxIter = intval($request->input('maxIter'));
-
-        // Chequeo de diagonal dominance
+        // Diagonal dominance check (informativo)
         $isDiag = $this->isDiagonallyDominant($A);
 
-        // Ejecutar método elegido (o automático: primero Gauss-Seidel luego Jacobi)
-        $result = [
+        // Ejecutar Gauss-Seidel
+        $gs = $this->gaussSeidel($A, $b, $tol, $maxIter);
+
+        // Ejecutar Jacobi también (informativo)
+        $jac = $this->jacobi($A, $b, $tol, $maxIter);
+
+        // Si ninguno converge usar fallback directo
+        if (($gs['status'] ?? '') !== 'ok' && ($jac['status'] ?? '') !== 'ok') {
+            $fallbackSolution = $this->gaussianElimination($A, $b);
+            $methodUsed = 'Gaussian elimination (fallback)';
+            $solution = $fallbackSolution;
+            $converged = true;
+            $iterations = null;
+            $residual = $this->residualInf($A, $solution, $b);
+        } else {
+            // Preferir Gauss-Seidel si convergió
+            if (($gs['status'] ?? '') === 'ok') {
+                $methodUsed = 'Gauss-Seidel';
+                $solution = $gs['solution'];
+                $converged = true;
+                $iterations = $gs['iterations'];
+                $residual = $gs['residual'];
+            } else {
+                $methodUsed = 'Jacobi';
+                $solution = $jac['solution'];
+                $converged = true;
+                $iterations = $jac['iterations'];
+                $residual = $jac['residual'];
+            }
+        }
+
+        // Interpretación y validaciones finales
+        // Si solución contiene negativos -> advertencia (puede ser físicamente inviable)
+        $hasNegative = false;
+        foreach ($solution as $v) if ($v < -1e-12) { $hasNegative = true; break; }
+
+        // Normalizar solución a porcentajes (si la suma es cero o negativa, no normalizar)
+        $sum = array_sum($solution);
+        $normalizedPerc = null;
+        if ($sum > 1e-12) {
+            $normalizedPerc = array_map(function($v) use ($sum){
+                return ($v / $sum) * 100.0; // en %
+            }, $solution);
+        }
+
+        // Composición lograda: A * solution
+        $achieved = $this->matVecMul($A, $solution); // en decimales (0..1)
+        // Convertir a % para mostrar
+        $achievedPerc = array_map(function($v){ return $v * 100.0; }, $achieved);
+
+        // Responder JSON (la vista usa fetch/ajax)
+        return response()->json([
+            'status' => 'ok',
+            'methodUsed' => $methodUsed,
             'isDiagonalDominant' => $isDiag,
+            'converged' => $converged,
+            'iterations' => $iterations,
+            'residual' => $residual,
+            'rawSolution' => $solution,
+            'normalizedPercent' => $normalizedPerc, // puede ser null si suma ~ 0
+            'hasNegative' => $hasNegative,
+            'achievedPerc' => $achievedPerc,
             'A' => $A,
-            'b' => $b,
-            'methodRequested' => $method,
-            'tolerance' => $tol,
-            'maxIter' => $maxIter,
-        ];
-
-        $methodsAttempted = [];
-
-        if ($method === 'jacobi' || $method === 'auto') {
-            $methodsAttempted[] = 'Jacobi';
-            $jacobi = $this->jacobi($A, $b, $tol, $maxIter);
-            $result['jacobi'] = $jacobi;
-            if ($method === 'jacobi' && $jacobi['status'] === 'ok') {
-                return $this->respond($request, $result);
-            }
-        }
-
-        if ($method === 'gauss' || $method === 'auto') {
-            $methodsAttempted[] = 'Gauss-Seidel';
-            $gs = $this->gaussSeidel($A, $b, $tol, $maxIter);
-            $result['gaussSeidel'] = $gs;
-            if ($method === 'gauss' && $gs['status'] === 'ok') {
-                return $this->respond($request, $result);
-            }
-        }
-
-        // Si ninguno converge → fallback con eliminación Gaussiana (directa)
-        $result['fallback'] = [
-            'method' => 'Gaussian Elimination (pivoting)',
-            'solution' => $this->gaussianElimination($A, $b)
-        ];
-
-        return $this->respond($request, $result);
+            'b' => $b
+        ]);
     }
 
-    private function respond(Request $request, $payload, $status = 200)
-    {
-        if ($request->ajax() || $request->wantsJson()) {
-            return response()->json($payload, $status);
-        }
-        // Si no es AJAX, redirigir a la vista pasando result (compatibilidad)
-        return view('nutrient_solver', ['result' => $payload]);
-    }
+    /* ---------- helpers numeric ---------- */
 
-    private function arrayToFloatMatrix($arr)
+    // Si el usuario pone 20 -> 0.20; 0.2 -> 0.2
+    private function toFraction($v)
     {
-        if (!is_array($arr) || count($arr) === 0) throw new \Exception("Invalid matrix");
-        $n = count($arr);
-        $mat = [];
-        for ($i = 0; $i < $n; $i++) {
-            if (!is_array($arr[$i])) throw new \Exception("Invalid matrix row");
-            $row = [];
-            for ($j = 0; $j < count($arr[$i]); $j++) {
-                if (!is_numeric($arr[$i][$j])) throw new \Exception("Non numeric");
-                $row[] = floatval($arr[$i][$j]);
-            }
-            $mat[] = $row;
-        }
-        // check rectangular
-        $m = count($mat[0]);
-        foreach ($mat as $r) {
-            if (count($r) !== $m) throw new \Exception("Matrix rows unequal length");
-        }
-        if ($m !== count($mat)) {
-            // allow non-square but our solvers expect square; throw
-            throw new \Exception("Se requiere matriz cuadrada (n x n)");
-        }
-        return $mat;
-    }
-
-    private function arrayToFloatVector($arr)
-    {
-        if (!is_array($arr)) throw new \Exception("Invalid vector");
-        $v = [];
-        foreach ($arr as $val) {
-            if (!is_numeric($val)) throw new \Exception("Non numeric vector");
-            $v[] = floatval($val);
-        }
-        return $v;
+        $v = str_replace(',', '.', trim($v));
+        if (!is_numeric($v)) throw new \Exception("Valor no numérico: $v");
+        $f = floatval($v);
+        if ($f > 1.0) return $f / 100.0;
+        return $f;
     }
 
     private function isDiagonallyDominant($A)
@@ -147,14 +133,13 @@ class NutrientSolverController extends Controller
         $n = count($A);
         for ($i = 0; $i < $n; $i++) {
             $diag = abs($A[$i][$i]);
-            $sum = 0;
-            for ($j = 0; $j < $n; $j++) if ($i !== $j) $sum += abs($A[$i][$j]);
+            $sum = 0.0;
+            for ($j = 0; $j < $n; $j++) if ($j !== $i) $sum += abs($A[$i][$j]);
             if ($diag < $sum) return false;
         }
         return true;
     }
 
-    // Norma infinito residual ||Ax - b||_inf
     private function residualInf($A, $x, $b)
     {
         $n = count($A);
@@ -173,8 +158,6 @@ class NutrientSolverController extends Controller
         $n = count($A);
         $x = array_fill(0, $n, 0.0);
         $xNew = $x;
-        $iter = 0;
-
         for ($k = 1; $k <= $maxIter; $k++) {
             for ($i = 0; $i < $n; $i++) {
                 $sum = 0.0;
@@ -185,54 +168,34 @@ class NutrientSolverController extends Controller
             }
             $err = $this->residualInf($A, $xNew, $b);
             $x = $xNew;
-            $iter = $k;
             if ($err <= $tol) {
-                return [
-                    'status' => 'ok',
-                    'solution' => $x,
-                    'iterations' => $iter,
-                    'residual' => $err
-                ];
+                return ['status'=>'ok','solution'=>$x,'iterations'=>$k,'residual'=>$err];
             }
         }
-
-        return ['status' => 'no_converge', 'iterations' => $iter];
+        return ['status'=>'no_converge','iterations'=>$maxIter];
     }
 
     private function gaussSeidel($A, $b, $tol, $maxIter)
     {
         $n = count($A);
         $x = array_fill(0, $n, 0.0);
-        $iter = 0;
-
         for ($k = 1; $k <= $maxIter; $k++) {
             for ($i = 0; $i < $n; $i++) {
                 $sum = 0.0;
-                for ($j = 0; $j < $n; $j++) {
-                    if ($j !== $i) $sum += $A[$i][$j] * $x[$j];
-                }
+                for ($j = 0; $j < $n; $j++) if ($j !== $i) $sum += $A[$i][$j] * $x[$j];
                 $x[$i] = ($b[$i] - $sum) / $A[$i][$i];
             }
             $err = $this->residualInf($A, $x, $b);
-            $iter = $k;
             if ($err <= $tol) {
-                return [
-                    'status' => 'ok',
-                    'solution' => $x,
-                    'iterations' => $iter,
-                    'residual' => $err
-                ];
+                return ['status'=>'ok','solution'=>$x,'iterations'=>$k,'residual'=>$err];
             }
         }
-
-        return ['status' => 'no_converge', 'iterations' => $iter];
+        return ['status'=>'no_converge','iterations'=>$maxIter];
     }
 
-    // Eliminación Gaussiana con pivoteo parcial (directo)
     private function gaussianElimination($A, $b)
     {
         $n = count($A);
-        // construir matriz aumentada
         $M = [];
         for ($i = 0; $i < $n; $i++) {
             $M[$i] = $A[$i];
@@ -243,33 +206,43 @@ class NutrientSolverController extends Controller
             // pivot
             $maxRow = $k;
             $maxVal = abs($M[$k][$k]);
-            for ($r = $k + 1; $r < $n; $r++) {
-                if (abs($M[$r][$k]) > $maxVal) {
-                    $maxVal = abs($M[$r][$k]);
-                    $maxRow = $r;
-                }
+            for ($r = $k+1; $r < $n; $r++) {
+                if (abs($M[$r][$k]) > $maxVal) { $maxVal = abs($M[$r][$k]); $maxRow = $r; }
             }
             if ($maxRow !== $k) {
-                $tmp = $M[$k];
-                $M[$k] = $M[$maxRow];
-                $M[$maxRow] = $tmp;
+                $tmp = $M[$k]; $M[$k] = $M[$maxRow]; $M[$maxRow] = $tmp;
             }
-            // eliminar
-            for ($i = $k + 1; $i < $n; $i++) {
+            // eliminate
+            for ($i = $k+1; $i < $n; $i++) {
                 if ($M[$k][$k] == 0) continue;
                 $f = $M[$i][$k] / $M[$k][$k];
-                for ($j = $k; $j <= $n; $j++) {
-                    $M[$i][$j] -= $f * $M[$k][$j];
-                }
+                for ($j = $k; $j <= $n; $j++) $M[$i][$j] -= $f * $M[$k][$j];
             }
         }
 
         $x = array_fill(0, $n, 0.0);
-        for ($i = $n - 1; $i >= 0; $i--) {
+        for ($i = $n-1; $i >= 0; $i--) {
             $s = $M[$i][$n];
-            for ($j = $i + 1; $j < $n; $j++) $s -= $M[$i][$j] * $x[$j];
+            for ($j = $i+1; $j < $n; $j++) $s -= $M[$i][$j] * $x[$j];
             $x[$i] = $s / $M[$i][$i];
         }
         return $x;
+    }
+
+    private function matVecMul($A, $x)
+    {
+        $n = count($A);
+        $y = array_fill(0, $n, 0.0);
+        for ($i = 0; $i < $n; $i++) {
+            $s = 0.0;
+            for ($j = 0; $j < $n; $j++) $s += $A[$i][$j] * $x[$j];
+            $y[$i] = $s;
+        }
+        return $y;
+    }
+
+    private function jsonError($msg, $code = 400)
+    {
+        return response()->json(['status'=>'error','message'=>$msg], $code);
     }
 }
